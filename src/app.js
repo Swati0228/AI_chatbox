@@ -8,10 +8,10 @@ export function createApp(summarizeService) {
   const app = express();
   app.use(express.text({ type: "*/*", limit: "100kb" }));
 
-  app.post("/api/summarize", async (request, response) => {
-    const ticket = typeof request.body === "string" ? request.body : "";
+  app.post("/api/chat", async (request, response) => {
+    const  message = typeof request.body === "string" ? request.body : "";
 
-    if (!ticket.trim()) {
+    if (!message.trim()) {
       return response
         .status(400)
         .type("text/plain")
@@ -19,14 +19,14 @@ export function createApp(summarizeService) {
     }
 
     try {
-      const summary = await summarizeService.summarize(ticket);
-      return response.type("text/plain").send(summary);
+      const message = await summarizeService.summarize(message);
+      return response.type("text/plain").send(message);
     } catch (error) {
-      console.error("Failed to summarize ticket:", error);
+      console.error("Failed to parse meesage:", error);
       return response
         .status(500)
         .type("text/plain")
-        .send("Unable to summarize the ticket.");
+        .send("Unable to parse the meesage.");
     }
   });
 
