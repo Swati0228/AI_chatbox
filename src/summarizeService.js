@@ -9,8 +9,22 @@ export function createSummarizeService({
 } = {}) {
   // history acts like private List<Message> history = new ArrayList<>(); in Java
   async function chat(message) {
-    // 1. Add user message to history (equivalent to history.add(new UserMessage(message)))
-    history.push({ role: "user", content: message });
+    const prompt = `You are a customer support executive of
+our food delivery application called Tomato.
+Respond to customer query professionally.
+
+If user is furious, or angry or have any issue use
+words like I understand your concern, or I am sorry
+you have to through this and so on. Then solve customer
+query and give a respone.
+
+Do not respond to any other message which is not related
+to Ordering food query, refund query, order tracking status query
+or company policy query.
+` + message;
+
+    // 1. Add user message with prompt to history (equivalent to history.add(new UserMessage(prompt)))
+    history.push({ role: "user", content: prompt });
 
     // 2. Send the conversation history to the model
     const response = await client.responses.create({
@@ -37,4 +51,5 @@ export function createSummarizeService({
     getHistory: () => history,
   };
 }
+
 
