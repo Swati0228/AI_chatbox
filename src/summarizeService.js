@@ -26,32 +26,74 @@ export function createSummarizeService({
     history.push({ role: "system", content: systemPrompt });
   }
 
-  async function chat(message) {
-    // 1. Add user message (clean user input, without polluting with repeated system instructions)
+  async function* stream(message) {
+    // 1. Add user message to history
     history.push({ role: "user", content: message });
 
-    // 2. Send conversation history (system role + turns) to the model
-    const response = await client.responses.create({
-      model,
-      input: history,
-      store: false,
-    });
+    // 2. Stream response from OpenAI using .stream() (or stream: true)
+    let responseStream;
+    if (typeof client.responses?.stream === "function") {
+      responseStream = client.responses.stream({
+        model,
+        input: [...history],
+        store: false,
+      });
+    } else {
+      const res = await client.responses.create({
+        model,
+        input: [...history],
+        stream: true,
+        store: false,
+      });
 
-    if (!response.output_text) {
+      // Handle async iterable stream or non-stream fallback (e.g. unit tests)
+      if (res && res[Symbol.asyncIterator]) {
+        responseStream = res;
+      } else {
+        const text = res?.output_text || "";
+        history.push({ role: "assistant", content: text });
+        yield text;
+        return;
+      }
+    }
+
+    // Dynamic string to accumulate chunks and update history
+    let dynamicString = "";
+
+    for await (const chunk of responseStream) {
+      const delta =
+        chunk?.type === "response.output_text.delta"
+          ? chunk.delta
+          : chunk?.delta ?? chunk?.choices?.[0]?.delta?.content ?? (typeof chunk === "string" ? chunk : "");
+
+      if (delta) {
+        dynamicString += delta;
+        yield delta;
+      }
+    }
+
+    if (!dynamicString) {
       throw new Error("OpenAI returned an empty response");
     }
 
-    const output = response.output_text;
+    // 3. Add accumulated assistant reply to history
+    history.push({ role: "assistant", content: dynamicString });
+  }
 
-    // 3. Add assistant reply to history
-    history.push({ role: "assistant", content: output });
-
-    return output;
+  async function chat(message) {
+    let dynamicString = "";
+    for await (const chunk of stream(message)) {
+      dynamicString += chunk;
+    }
+    return dynamicString;
   }
 
   return {
+    stream,
     chat,
-    summarize: chat, // Keep summarize as alias so existing code/tests work
+    chatStream: stream,
+    summarize: chat,
+    summarizeStream: stream,
     getHistory: () => history,
   };
 }

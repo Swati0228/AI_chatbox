@@ -41,3 +41,21 @@ test("POST /api/summarize rejects an empty ticket", async () => {
   assert.equal(response.status, 400);
   assert.equal(response.text, "Ticket text is required.");
 });
+
+test("POST /api/chat streams response chunks when stream service is provided", async () => {
+  const service = {
+    stream: async function* (message) {
+      assert.equal(message, "Where is my order?");
+      yield "Tracking ";
+      yield "details.";
+    },
+  };
+
+  const response = await request(createApp(service))
+    .post("/api/chat")
+    .type("text/plain")
+    .send("Where is my order?");
+
+  assert.equal(response.status, 200);
+  assert.equal(response.text, "Tracking details.");
+});

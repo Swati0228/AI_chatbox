@@ -1,13 +1,37 @@
 import express from "express";
 
 export function createApp(summarizeService) {
+  const streamFn = summarizeService?.stream || summarizeService?.chatStream || summarizeService?.summarizeStream;
   const chatFn = summarizeService?.chat || summarizeService?.summarize;
-  if (typeof chatFn !== "function") {
+  if (typeof streamFn !== "function" && typeof chatFn !== "function") {
     throw new TypeError("A chat or summarize service is required");
   }
 
   const app = express();
   app.use(express.text({ type: "*/*", limit: "100kb" }));
+
+  async function handleRequest(input, response, errorMessage) {
+    try {
+      if (typeof streamFn === "function") {
+        response.setHeader("Content-Type", "text/plain; charset=utf-8");
+        response.setHeader("Transfer-Encoding", "chunked");
+        const stream = streamFn.call(summarizeService, input);
+        for await (const chunk of stream) {
+          response.write(chunk);
+        }
+        return response.end();
+      }
+
+      const reply = await chatFn.call(summarizeService, input);
+      return response.type("text/plain").send(reply);
+    } catch (error) {
+      console.error(errorMessage, error);
+      if (!response.headersSent) {
+        return response.status(500).type("text/plain").send(errorMessage);
+      }
+      return response.end();
+    }
+  }
 
   // Chat endpoint
   app.post("/api/chat", async (request, response) => {
@@ -20,16 +44,7 @@ export function createApp(summarizeService) {
         .send("Message text is required.");
     }
 
-    try {
-      const reply = await chatFn.call(summarizeService, message);
-      return response.type("text/plain").send(reply);
-    } catch (error) {
-      console.error("Failed to process message:", error);
-      return response
-        .status(500)
-        .type("text/plain")
-        .send("Unable to process the message.");
-    }
+    return handleRequest(message, response, "Unable to process the message.");
   });
 
   // Backward-compatible endpoint for ticket summarizer
@@ -43,16 +58,7 @@ export function createApp(summarizeService) {
         .send("Ticket text is required.");
     }
 
-    try {
-      const reply = await chatFn.call(summarizeService, ticket);
-      return response.type("text/plain").send(reply);
-    } catch (error) {
-      console.error("Failed to summarize ticket:", error);
-      return response
-        .status(500)
-        .type("text/plain")
-        .send("Unable to summarize the ticket.");
-    }
+    return handleRequest(ticket, response, "Unable to summarize the ticket.");
   });
 
   return app;
