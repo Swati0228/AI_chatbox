@@ -5,14 +5,15 @@
  * support chatbot. Responsibilities:
  *
  *  1. INDEXING  — Load PDF files from the knowledge/ directory, split them
- *                 into overlapping text chunks, embed each chunk with the
- *                 OpenAI embeddings API, and store the vectors in Pinecone.
+ *                 into overlapping text chunks, and store them in Pinecone.
+ *                 Pinecone's integrated model (llama-text-embed-v2) handles
+ *                 embedding automatically — no OpenAI embeddings needed.
  *
- *  2. RETRIEVAL — Given a user query, embed it, search Pinecone for the
- *                 top-K most relevant chunks, and return them as a
- *                 formatted context string.
+ *  2. RETRIEVAL — Pass the user query as plain text to Pinecone; its
+ *                 integrated model embeds the query and returns the top-K
+ *                 most relevant chunks.
  *
- *  3. GENERATION — Inject the retrieved context into the system prompt and
+ *  3. GENERATION — Inject the retrieved chunks into the system prompt and
  *                  call the LLM (streaming or non-streaming) via the existing
  *                  summarizeService factory, so all existing endpoints keep
  *                  working unchanged.
@@ -37,20 +38,14 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** Folder containing the company policy PDF files. */
 const KNOWLEDGE_DIR = path.join(__dirname, "..", "knowledge");
 
-/** Embedding model — small, fast, cheap (1536 dimensions). */
-const EMBEDDING_MODEL = "text-embedding-3-small";
+/** Number of retrieved chunks to inject as context. */
+const TOP_K = 3;
 
-/**
- * Target chunk size in characters.
- * ~300 chars ≈ 75 tokens, well inside the 8191-token embedding limit.
- */
+/** Target chunk size in characters (~300 chars ≈ 75 tokens). */
 const CHUNK_SIZE = 300;
 
 /** Overlap between consecutive chunks to preserve context across boundaries. */
 const CHUNK_OVERLAP = 50;
-
-/** Number of retrieved chunks to inject as context. */
-const TOP_K = 3;
 
 // ---------------------------------------------------------------------------
 // Text splitting helpers
@@ -122,30 +117,6 @@ async function loadPDFs() {
 }
 
 // ---------------------------------------------------------------------------
-// Embedding helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Batch-embed an array of strings using the OpenAI embeddings endpoint.
- * Returns one embedding vector per input string.
- *
- * @param {OpenAI} client
- * @param {string[]} texts
- * @returns {Promise<number[][]>}
- */
-async function embedBatch(client, texts) {
-  if (texts.length === 0) return [];
-  const response = await client.embeddings.create({
-    model: EMBEDDING_MODEL,
-    input: texts,
-  });
-  // Sort by index to guarantee ordering (API guarantees it, but let's be safe)
-  return response.data
-    .sort((a, b) => a.index - b.index)
-    .map((item) => item.embedding);
-}
-
-// ---------------------------------------------------------------------------
 // Public factory
 // ---------------------------------------------------------------------------
 
@@ -183,20 +154,14 @@ export async function createRagService({
 
   for (const { filename, text } of pdfs) {
     const chunks = splitIntoChunks(text);
-    console.log(`[RAG] ${filename}: ${chunks.length} chunks to embed`);
+    console.log(`[RAG] ${filename}: ${chunks.length} chunks to index`);
 
-    // Embed in batches of 100 (well within the API limit of 2048 inputs)
-    const BATCH = 100;
-    for (let i = 0; i < chunks.length; i += BATCH) {
-      const batch = chunks.slice(i, i + BATCH);
-      const embeddings = await embedBatch(client, batch);
-      // Pinecone upserts are async — await each add call.
-      for (let j = 0; j < embeddings.length; j++) {
-        await vectorStore.add(batch[j], embeddings[j], {
-          source: filename,
-          chunkIndex: i + j,
-        });
-      }
+    // Pinecone's integrated model handles embedding — just pass text + metadata.
+    for (let i = 0; i < chunks.length; i++) {
+      await vectorStore.add(chunks[i], {
+        source: filename,
+        chunkIndex: i,
+      });
     }
     console.log(`[RAG] ${filename}: indexed ✓`);
   }
@@ -210,16 +175,17 @@ export async function createRagService({
   // -----------------------------------------------------------------------
 
   /**
-   * Embed a query string and retrieve the top-K most relevant chunks.
+   * Retrieve the top-K most relevant chunks for a query.
+   * Pinecone's integrated model embeds the query automatically.
    *
    * @param {string} query
-   * @returns {Promise<string>}   Formatted context block ready to inject
+   * @returns {Promise<string>}  Retrieved chunks joined as plain text
    */
   async function retrieveContext(query) {
     if (vectorStore.size() === 0) return "";
 
-    const [queryEmbedding] = await embedBatch(client, [query]);
-    const results = await vectorStore.search(queryEmbedding, topK);
+    // Pass the raw query text — Pinecone handles embedding internally.
+    const results = await vectorStore.search(query, topK);
 
     if (results.length === 0) return "";
 
