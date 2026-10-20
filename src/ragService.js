@@ -6,11 +6,10 @@
  *
  *  1. INDEXING  — Load PDF files from the knowledge/ directory, split them
  *                 into overlapping text chunks, embed each chunk with the
- *                 OpenAI embeddings API, and store the vectors in the
- *                 in-memory vector store.
+ *                 OpenAI embeddings API, and store the vectors in Pinecone.
  *
- *  2. RETRIEVAL — Given a user query, embed it, search the vector store
- *                 for the top-K most relevant chunks, and return them as a
+ *  2. RETRIEVAL — Given a user query, embed it, search Pinecone for the
+ *                 top-K most relevant chunks, and return them as a
  *                 formatted context string.
  *
  *  3. GENERATION — Inject the retrieved context into the system prompt and
@@ -26,7 +25,7 @@ import { fileURLToPath } from "node:url";
 import pdfParse from "pdf-parse";
 import OpenAI from "openai";
 
-import { createVectorStore } from "./vectorStore.js";
+import { createPineconeStore } from "./pineconeStore.js";
 import { createSummarizeService, DEFAULT_SYSTEM_PROMPT } from "./summarizeService.js";
 
 // ---------------------------------------------------------------------------
@@ -172,7 +171,8 @@ export async function createRagService({
   model = process.env.OPENAI_MODEL || "gpt-4o-mini",
   topK = TOP_K,
 } = {}) {
-  const vectorStore = createVectorStore();
+  // Pinecone store is async — it connects and verifies the index on init.
+  const vectorStore = await createPineconeStore();
 
   // -----------------------------------------------------------------------
   // STEP 1 — INDEXING: Load PDFs, chunk, embed, store
@@ -190,12 +190,13 @@ export async function createRagService({
     for (let i = 0; i < chunks.length; i += BATCH) {
       const batch = chunks.slice(i, i + BATCH);
       const embeddings = await embedBatch(client, batch);
-      embeddings.forEach((embedding, j) => {
-        vectorStore.add(batch[j], embedding, {
+      // Pinecone upserts are async — await each add call.
+      for (let j = 0; j < embeddings.length; j++) {
+        await vectorStore.add(batch[j], embeddings[j], {
           source: filename,
           chunkIndex: i + j,
         });
-      });
+      }
     }
     console.log(`[RAG] ${filename}: indexed ✓`);
   }
@@ -218,35 +219,61 @@ export async function createRagService({
     if (vectorStore.size() === 0) return "";
 
     const [queryEmbedding] = await embedBatch(client, [query]);
-    const results = vectorStore.search(queryEmbedding, topK);
+    const results = await vectorStore.search(queryEmbedding, topK);
 
     if (results.length === 0) return "";
 
-    const contextLines = results.map(
-      (r, i) =>
-        `[Source: ${r.metadata.source ?? "unknown"}, score: ${r.score.toFixed(3)}]\n${r.chunk}`
-    );
-
-    return (
-      "--- Relevant company knowledge ---\n" +
-      contextLines.join("\n\n") +
-      "\n--- End of knowledge ---"
-    );
+    return results
+      .map((r) => r.chunk)
+      .join("\n\n");
   }
 
   // -----------------------------------------------------------------------
-  // STEP 3 — GENERATION: Wrap the inner summarizeService with RAG context
+  // STEP 3 — GENERATION: Single service instance; system prompt is passed
+  // directly as a template string with the RAG context injected each turn.
   // -----------------------------------------------------------------------
 
   /**
-   * Build a fresh single-turn summarize service for each message, injecting
-   * the retrieved context into the system prompt. We create a new service
-   * per call so that the RAG context is scoped to that message, while the
-   * outer `history` array maintains the multi-turn conversation history.
+   * Build the augmented system prompt by injecting the retrieved company
+   * knowledge directly into the prompt string — matching the pattern:
+   *
+   *   <base instructions>
+   *
+   *   COMPANY INFORMATION:
+   *   <retrieved chunks>
+   *
+   *   Answer the customer using ONLY the above information.
+   *   If the answer is not in the documents, say so politely.
+   *
+   * @param {string} context - Retrieved chunks joined as plain text
+   * @returns {string}
    */
+  function buildSystemPrompt(context) {
+    if (!context) return DEFAULT_SYSTEM_PROMPT;
 
-  /** Conversation history shared across turns (system prompt added below). */
-  const history = [];
+    return `${DEFAULT_SYSTEM_PROMPT}
+
+COMPANY INFORMATION:
+${context}
+
+Answer the customer using ONLY the information provided above.
+If the answer is not available in the company documents, politely say:
+"I don't have that information in our company documents. Please contact support@tomato.com for further help."`;
+  }
+
+  /**
+   * One service instance is created per conversation session.
+   * We pass the augmented system prompt directly via the systemPrompt option;
+   * createSummarizeService places it as history[0] with role "system".
+   *
+   * On each subsequent turn we swap out history[0] so the freshly retrieved
+   * context always reflects the current query.
+   */
+  const service = createSummarizeService({
+    client,
+    model,
+    systemPrompt: buildSystemPrompt(""),
+  });
 
   /**
    * Core RAG-augmented streaming generator.
@@ -255,41 +282,18 @@ export async function createRagService({
    * @yields {string} streaming delta chunks
    */
   async function* stream(message) {
-    // 1. Retrieve relevant context chunks
+    // 1. Retrieve relevant context for this specific query
     const context = await retrieveContext(message);
 
-    // 2. Augment the system prompt with retrieved context (if any)
-    const augmentedSystemPrompt = context
-      ? `${DEFAULT_SYSTEM_PROMPT}\n\n${context}`
-      : DEFAULT_SYSTEM_PROMPT;
+    // 2. Pass the augmented system prompt directly — update history[0] so the
+    //    freshest context is always in the system role for this turn.
+    service.getHistory()[0] = {
+      role: "system",
+      content: buildSystemPrompt(context),
+    };
 
-    // 3. Build an ephemeral service with the augmented system prompt and
-    //    the current conversation history (minus the system message if
-    //    already present, so we can replace it with the augmented version).
-    const conversationHistory = history.filter((m) => m.role !== "system");
-
-    const ephemeralService = createSummarizeService({
-      client,
-      model,
-      systemPrompt: augmentedSystemPrompt,
-      history: [
-        { role: "system", content: augmentedSystemPrompt },
-        ...conversationHistory,
-      ],
-    });
-
-    // 4. Stream the response
-    let fullReply = "";
-    for await (const chunk of ephemeralService.stream(message)) {
-      fullReply += chunk;
-      yield chunk;
-    }
-
-    // 5. Persist the raw user message and assistant reply in the shared
-    //    conversation history (without the retrieved context, which changes
-    //    each turn).
-    history.push({ role: "user", content: message });
-    history.push({ role: "assistant", content: fullReply });
+    // 3. Stream the response through the single service instance
+    yield* service.stream(message);
   }
 
   /**
@@ -312,7 +316,7 @@ export async function createRagService({
     chatStream: stream,
     summarize: chat,
     summarizeStream: stream,
-    getHistory: () => history,
+    getHistory: () => service.getHistory(),
     getVectorStoreSize: () => vectorStore.size(),
   };
 }
