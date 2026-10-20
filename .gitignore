@@ -15,3 +15,7 @@ yarn-error.log*
 .DS_Store
 .vscode/
 .idea/
+
+# RAG knowledge base PDFs (regenerate with: npm run seed)
+# Uncomment the line below to exclude PDFs from git
+# knowledge/*.pdf
