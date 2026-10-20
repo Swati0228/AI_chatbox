@@ -1,57 +1,54 @@
 /**
  * pineconeStore.js
  *
- * Pinecone vector store adapter that exposes the same
- * { add, search, size } interface as the in-memory vectorStore.js,
- * so ragService.js can swap backends with a single import change.
+ * Pinecone vector store adapter using Pinecone's **integrated inference**
+ * (e.g. llama-text-embed-v2). Pinecone embeds the text automatically —
+ * no external embedding API call is needed.
+ *
+ * Interface exposed (text-based, not vector-based):
+ *   add(chunk, metadata?)  → Promise<void>
+ *   search(query, topK?)   → Promise<Array<{chunk, score, metadata}>>
+ *   size()                 → number
  *
  * Prerequisites
  * -------------
  * 1. A Pinecone account → https://app.pinecone.io
- * 2. An index created with:
- *      - Dimensions : 1536  (matches text-embedding-3-small)
- *      - Metric     : cosine
- * 3. Environment variables set in .env:
+ * 2. An index created with an integrated embedding model
+ *    (e.g. llama-text-embed-v2) — exactly what you have!
+ * 3. Environment variables in .env:
  *      PINECONE_API_KEY=<your-api-key>
- *      PINECONE_INDEX=<your-index-name>
- *
- * Usage
- * -----
- *   import { createPineconeStore } from "./pineconeStore.js";
- *   const store = await createPineconeStore();   // ← async init
+ *      PINECONE_INDEX=tomato-support
+ *      PINECONE_NAMESPACE=tomato-knowledge  (optional)
  */
 
 import { Pinecone } from "@pinecone-database/pinecone";
 import crypto from "node:crypto";
 
-/** Embedding dimensions produced by text-embedding-3-small. */
-const EMBEDDING_DIMENSIONS = 1536;
-
 /**
- * Generates a stable, deterministic ID for a chunk so that re-indexing
- * the same document does not create duplicate vectors.
+ * Generate a stable, deterministic record ID so re-indexing the same
+ * document never creates duplicate vectors — Pinecone upserts over same IDs.
  *
  * @param {string} chunk
  * @param {object} metadata
  * @returns {string}
  */
-function chunkId(chunk, metadata) {
+function recordId(chunk, metadata = {}) {
   const raw = `${metadata.source ?? ""}::${metadata.chunkIndex ?? 0}::${chunk.slice(0, 64)}`;
   return crypto.createHash("sha1").update(raw).digest("hex");
 }
 
 /**
- * Initialise and return a Pinecone-backed vector store.
+ * Initialise and return a Pinecone-backed vector store (integrated inference).
  *
  * @param {{
- *   apiKey?: string,
- *   indexName?: string,
- *   namespace?: string,
+ *   apiKey?    : string,
+ *   indexName? : string,
+ *   namespace? : string,
  * }} [options]
  *
  * @returns {Promise<{
- *   add    : (chunk: string, embedding: number[], metadata?: object) => Promise<void>,
- *   search : (queryEmbedding: number[], topK?: number) => Promise<Array<{chunk: string, score: number, metadata: object}>>,
+ *   add    : (chunk: string, metadata?: object) => Promise<void>,
+ *   search : (query: string, topK?: number) => Promise<Array<{chunk: string, score: number, metadata: object}>>,
  *   size   : () => number,
  * }>}
  */
@@ -65,53 +62,55 @@ export async function createPineconeStore({
 
   const pinecone = new Pinecone({ apiKey });
 
-  // Verify the index exists; fail fast with a clear message if not.
-  const existingIndexes = await pinecone.listIndexes();
-  const names = (existingIndexes.indexes ?? []).map((i) => i.name);
+  // Verify the index exists before we proceed.
+  const { indexes = [] } = await pinecone.listIndexes();
+  const names = indexes.map((i) => i.name);
   if (!names.includes(indexName)) {
     throw new Error(
       `Pinecone index "${indexName}" not found. ` +
-      `Available indexes: ${names.join(", ") || "(none)"}. ` +
-      "Create it at https://app.pinecone.io with dimension=1536 and metric=cosine."
+      `Available: ${names.join(", ") || "(none)"}. ` +
+      "Create it at https://app.pinecone.io with an integrated embedding model."
     );
   }
 
+  // Use the namespace-scoped index reference for all record operations.
   const index = pinecone.index(indexName).namespace(namespace);
 
-  /** Local count — Pinecone's describeIndexStats() is eventually consistent. */
+  /** Locally-tracked count (Pinecone stats are eventually consistent). */
   let _size = 0;
 
-  // Fetch the current count from Pinecone so restarts don't reset to 0.
+  // Fetch current record count so restarts don't reset the counter to 0.
   try {
     const stats = await pinecone.index(indexName).describeIndexStats();
-    const nsStats = stats.namespaces?.[namespace];
-    _size = nsStats?.recordCount ?? 0;
-    console.log(`[Pinecone] Connected to index "${indexName}" (namespace: "${namespace}"), ${_size} existing vectors.`);
+    _size = stats.namespaces?.[namespace]?.recordCount ?? 0;
+    console.log(
+      `[Pinecone] Connected → index: "${indexName}", namespace: "${namespace}", ` +
+      `existing records: ${_size}`
+    );
   } catch {
-    console.warn("[Pinecone] Could not fetch index stats; size counter starts at 0.");
+    console.warn("[Pinecone] Could not fetch index stats; counter starts at 0.");
   }
 
   // -------------------------------------------------------------------------
-  // add — upsert one chunk + embedding into Pinecone
+  // add — upsert one chunk into Pinecone (integrated inference embeds it)
   // -------------------------------------------------------------------------
 
   /**
-   * @param {string}   chunk
-   * @param {number[]} embedding
-   * @param {object}   [metadata]
+   * Upsert a text chunk. Pinecone uses its integrated model (llama-text-embed-v2)
+   * to generate the vector — no external embedding call needed.
+   *
+   * @param {string} chunk     - Raw text to store
+   * @param {object} [metadata]
    */
-  async function add(chunk, embedding, metadata = {}) {
-    const id = chunkId(chunk, metadata);
+  async function add(chunk, metadata = {}) {
+    const id = recordId(chunk, metadata);
 
-    await index.upsert([
+    // upsertRecords is the integrated-inference API — pass text, not vectors.
+    await index.upsertRecords([
       {
         id,
-        values: embedding,
-        metadata: {
-          ...metadata,
-          // Store the raw text in the metadata so we can return it on query
-          chunk,
-        },
+        chunk,          // stored in metadata; returned on search
+        ...metadata,    // source, chunkIndex, etc.
       },
     ]);
 
@@ -119,33 +118,39 @@ export async function createPineconeStore({
   }
 
   // -------------------------------------------------------------------------
-  // search — query Pinecone and return top-K results
+  // search — query Pinecone with raw text (integrated inference embeds it)
   // -------------------------------------------------------------------------
 
   /**
-   * @param {number[]} queryEmbedding
-   * @param {number}   [topK=3]
+   * Search using a plain text query. Pinecone embeds the query internally
+   * with llama-text-embed-v2 and returns the nearest neighbours.
+   *
+   * @param {string} query
+   * @param {number} [topK=3]
    * @returns {Promise<Array<{chunk: string, score: number, metadata: object}>>}
    */
-  async function search(queryEmbedding, topK = 3) {
-    const response = await index.query({
-      vector: queryEmbedding,
-      topK,
-      includeMetadata: true,
+  async function search(query, topK = 3) {
+    // searchRecords is the integrated-inference query API.
+    const response = await index.searchRecords({
+      query: {
+        inputs: { text: query },
+        topK,
+      },
+      fields: ["chunk", "source", "chunkIndex"],
     });
 
-    return (response.matches ?? []).map((match) => {
-      const { chunk, ...rest } = match.metadata ?? {};
+    return (response.result?.hits ?? []).map((hit) => {
+      const { chunk = "", ...rest } = hit.fields ?? {};
       return {
-        chunk : chunk ?? "",
-        score : match.score ?? 0,
+        chunk,
+        score   : hit._score ?? 0,
         metadata: rest,
       };
     });
   }
 
   // -------------------------------------------------------------------------
-  // size — returns the locally-tracked count
+  // size — returns the locally-tracked record count
   // -------------------------------------------------------------------------
   function size() {
     return _size;
